@@ -18,8 +18,9 @@ from case_classifier.law_index import (
 )
 
 from openfisca_switzerland import CountryTaxBenefitSystem
+from bern_stipendium.system import CountryTaxBenefitSystem as BernTaxBenefitSystem
 
-from oll_law_as_code.runner import run_variables
+from oll_law_as_code.runner import run_variables, TBS_FACTORIES, _HOUSEHOLD_ROLES
 
 from oll_api_server.i18n import (
     build_language_prefix,
@@ -38,15 +39,17 @@ log = logging.getLogger(__name__)
 # Module-level caches populated at startup
 _law_cache: list[dict] = []
 _law_index_prompt: str = ""
-_tbs: CountryTaxBenefitSystem | None = None
+_tbs_cache: dict[str, object] = {}
 
 
-def _get_tbs() -> CountryTaxBenefitSystem:
-    """Return a cached TaxBenefitSystem instance (created once)."""
-    global _tbs  # noqa: PLW0603
-    if _tbs is None:
-        _tbs = CountryTaxBenefitSystem()
-    return _tbs
+def _get_tbs(system: str = "openfisca_switzerland"):
+    """Return a cached TaxBenefitSystem instance for the given system."""
+    if system not in _tbs_cache:
+        factory = TBS_FACTORIES.get(system)
+        if factory is None:
+            raise ValueError(f"Unknown system: {system!r}")
+        _tbs_cache[system] = factory()
+    return _tbs_cache[system]
 
 
 def load_law_index() -> None:
@@ -65,6 +68,49 @@ def get_cached_laws() -> list[dict]:
 def get_cached_law_index_prompt() -> str:
     """Return the cached formatted law index for LLM prompts."""
     return _law_index_prompt
+
+
+def get_augmentation_fields(applicable_law_refs: list[str]) -> list[dict]:
+    """Return deduplicated input fields for the given law references.
+
+    For each law, iterates its ``input_parameters`` and resolves the
+    human-readable label from the TaxBenefitSystem variable when available,
+    falling back to the YAML ``description``.
+
+    No LLM calls — pure in-memory lookup.
+    """
+    seen: set[str] = set()
+    fields: list[dict] = []
+
+    for ref in applicable_law_refs:
+        law = get_law_by_reference(ref, _law_cache)
+        if law is None:
+            log.warning("Unknown law reference %r — skipping", ref)
+            continue
+
+        system = law.get("system", "openfisca_switzerland")
+        try:
+            tbs = _get_tbs(system)
+        except ValueError:
+            log.warning("Unknown TBS system %r for %r — skipping", system, ref)
+            continue
+
+        for param in law.get("input_parameters", []):
+            name = param.get("name", "")
+            if not name or name in seen:
+                continue
+            seen.add(name)
+
+            tbs_var = tbs.variables.get(name)
+            label = (
+                tbs_var.label
+                if tbs_var is not None and getattr(tbs_var, "label", None)
+                else param.get("description", name)
+            )
+
+            fields.append({"id": name, "full_name": label, "value": 0})
+
+    return fields
 
 
 # ---------------------------------------------------------------------------
@@ -121,18 +167,25 @@ def _lookup_variables(applicable_law_refs: list[str]) -> list[dict]:
                 "article_reference": ref,
                 "openfisca_variable": law["openfisca_variable"],
                 "law_name": law.get("law_name", ""),
+                "system": law.get("system", "openfisca_switzerland"),
             })
         else:
             log.warning("No openfisca_variable mapping for %r", ref)
     return results
 
 
-def _run_execution(variable_names: list[str], input_data: dict | None, period: str):
+def _run_execution(
+    variable_names: list[str],
+    input_data: dict | None,
+    period: str,
+    system: str = "openfisca_switzerland",
+):
     """Stage 3: Execute pre-registered variables by name."""
     return run_variables(
         variable_names=variable_names,
         input_data=input_data,
         period=period,
+        system=system,
     )
 
 
@@ -203,28 +256,65 @@ async def run_pipeline(request: ClassifyRequest) -> ClassifyResponse:
                 error_stage="pre_execution",
             )
         else:
-            # Build input_data from parsed parameters
-            input_data = _build_input_data(input_params, request.period)
+            # Group variable mappings by system for multi-system dispatch
+            groups: dict[str, list[dict]] = {}
+            for m in variable_mappings:
+                sys_key = m.get("system", "openfisca_switzerland")
+                groups.setdefault(sys_key, []).append(m)
 
-            try:
-                exec_result = await asyncio.to_thread(
-                    _run_execution, variable_names, input_data, request.period
-                )
-                execution = ExecutionResult(
-                    success=exec_result.success,
-                    computed_values=exec_result.computed_values,
-                    error=exec_result.error,
-                    error_stage=exec_result.error_stage,
-                )
-            except Exception as exc:
-                log.exception("Execution failed")
-                execution = ExecutionResult(
-                    success=False,
-                    error=translate_error("execution_failed", lang, detail=str(exc)),
-                    error_stage="runtime",
-                )
+            merged_computed: dict[str, float] = {}
+            first_error = ""
+            first_error_stage = ""
+            all_success = True
+
+            for sys_key, sys_mappings in groups.items():
+                sys_var_names = [m["openfisca_variable"] for m in sys_mappings]
+                input_data = _build_input_data(input_params, request.period, system=sys_key)
+
+                try:
+                    exec_result = await asyncio.to_thread(
+                        _run_execution, sys_var_names, input_data, request.period, sys_key
+                    )
+                    merged_computed.update(exec_result.computed_values)
+                    if not exec_result.success:
+                        all_success = False
+                        if not first_error:
+                            first_error = exec_result.error
+                            first_error_stage = exec_result.error_stage
+                except Exception as exc:
+                    log.exception("Execution failed for system %s", sys_key)
+                    all_success = False
+                    if not first_error:
+                        first_error = translate_error("execution_failed", lang, detail=str(exc))
+                        first_error_stage = "runtime"
+
+            execution = ExecutionResult(
+                success=all_success,
+                computed_values=merged_computed,
+                error=first_error,
+                error_stage=first_error_stage,
+            )
 
         stages.append("execution")
+
+    # --- Stage 4: Filter inapplicable laws ---
+    if execution and execution.success:
+        (
+            applicable_law_refs,
+            code_items,
+            input_params,
+            execution,
+            filtered_reasoning,
+            legal_reasoning,
+        ) = _filter_inapplicable_laws(
+            applicable_law_refs,
+            code_items,
+            input_params,
+            execution,
+            result.syllogistic_reasoning,
+            variable_mappings,
+            lang,
+        )
 
     return ClassifyResponse(
         syllogistic_reasoning=filtered_reasoning,
@@ -238,7 +328,11 @@ async def run_pipeline(request: ClassifyRequest) -> ClassifyResponse:
     )
 
 
-def _build_input_data(input_params: dict, period: str) -> dict | None:
+def _build_input_data(
+    input_params: dict,
+    period: str,
+    system: str = "openfisca_switzerland",
+) -> dict | None:
     """Convert classifier input_parameters to OpenFisca simulation input format.
 
     Validates each parameter name against the TaxBenefitSystem and uses the
@@ -250,8 +344,9 @@ def _build_input_data(input_params: dict, period: str) -> dict | None:
     if not input_params:
         return None
 
-    tbs = _get_tbs()
+    tbs = _get_tbs(system)
     person_data: dict = {}
+    household_data: dict = {}
     year = period[:4]
 
     for _law_ref, params in input_params.items():
@@ -259,21 +354,118 @@ def _build_input_data(input_params: dict, period: str) -> dict | None:
             continue
         for key, value in params.items():
             if key not in tbs.variables:
-                log.warning("Skipping unknown variable %r (not in TBS)", key)
+                log.warning("Skipping unknown variable %r (not in TBS %s)", key, system)
                 continue
             var = tbs.variables[key]
-            if str(var.definition_period).upper() == "YEAR":
-                person_data[key] = {year: value}
-            else:
-                person_data[key] = {period: value}
+            period_key = year if str(var.definition_period).upper() == "YEAR" else period
 
-    if not person_data:
+            # Household-level variables (e.g. eltern_anrechenbare_mittel)
+            if str(var.entity.key) == "household":
+                household_data[key] = {period_key: value}
+            else:
+                person_data[key] = {period_key: value}
+
+    if not person_data and not household_data:
         return None
 
-    return {
+    role_key = _HOUSEHOLD_ROLES.get(system, "parents")
+    result = {
         "persons": {"p1": person_data},
-        "households": {"h1": {"parents": ["p1"]}},
+        "households": {"h1": {role_key: ["p1"], **household_data}},
     }
+    return result
+
+
+def _filter_inapplicable_laws(
+    applicable_law_refs: list[str],
+    code_items: list[CodeGenerationItem],
+    input_params: dict,
+    execution: ExecutionResult,
+    raw_reasoning: str,
+    variable_mappings: list[dict],
+    language: str,
+) -> tuple[list[str], list[CodeGenerationItem], dict, ExecutionResult, str, str]:
+    """Remove laws whose boolean OpenFisca result evaluated to False.
+
+    Only boolean variables are considered — a numeric variable returning 0
+    does not mean "inapplicable" (e.g. ``ahv_employee_contribution`` or
+    ``stipendium_betrag`` can legitimately be 0).
+
+    Returns updated copies of all pipeline outputs.
+    """
+    if not execution or not execution.computed_values:
+        return (applicable_law_refs, code_items, input_params, execution,
+                raw_reasoning, _extract_legal_reasoning(raw_reasoning, language))
+
+    # Build a map: openfisca_variable -> article_reference, system
+    var_to_ref: dict[str, str] = {}
+    var_to_system: dict[str, str] = {}
+    for m in variable_mappings:
+        var_to_ref[m["openfisca_variable"]] = m["article_reference"]
+        var_to_system[m["openfisca_variable"]] = m.get("system", "openfisca_switzerland")
+
+    # Identify laws to remove: only boolean variables that evaluated to False
+    refs_to_remove: set[str] = set()
+    for var_name, value in execution.computed_values.items():
+        sys_key = var_to_system.get(var_name, "openfisca_switzerland")
+        try:
+            tbs = _get_tbs(sys_key)
+            var_def = tbs.variables.get(var_name)
+            if var_def is None:
+                continue
+            if var_def.value_type is bool and value <= 0:
+                ref = var_to_ref.get(var_name)
+                if ref:
+                    refs_to_remove.add(ref)
+        except Exception:
+            log.warning("Could not check value_type for %r", var_name)
+
+    if not refs_to_remove:
+        return (applicable_law_refs, code_items, input_params, execution,
+                _filter_reasoning_by_applicable_laws(raw_reasoning, applicable_law_refs),
+                _extract_legal_reasoning(
+                    _filter_reasoning_by_applicable_laws(raw_reasoning, applicable_law_refs),
+                    language,
+                ))
+
+    # Filter all outputs
+    new_law_refs = [r for r in applicable_law_refs if r not in refs_to_remove]
+    new_code_items = [c for c in code_items if c.article_reference not in refs_to_remove]
+    new_input_params = {
+        k: v for k, v in input_params.items() if k not in refs_to_remove
+    }
+
+    # Remove filtered variables from computed_values
+    vars_to_remove = {
+        var_name for var_name, ref in var_to_ref.items()
+        if ref in refs_to_remove
+    }
+    new_computed = {
+        k: v for k, v in execution.computed_values.items()
+        if k not in vars_to_remove
+    }
+    new_execution = ExecutionResult(
+        success=execution.success,
+        computed_values=new_computed,
+        error=execution.error,
+        error_stage=execution.error_stage,
+    )
+
+    # Re-filter reasoning for remaining laws
+    new_reasoning = _filter_reasoning_by_applicable_laws(raw_reasoning, new_law_refs)
+    new_legal_reasoning = _extract_legal_reasoning(new_reasoning, language)
+
+    # Edge case: all laws filtered out
+    if not new_law_refs:
+        new_execution = ExecutionResult(
+            success=new_execution.success,
+            computed_values=new_execution.computed_values,
+            error="no_applicable_laws",
+            error_stage=new_execution.error_stage,
+        )
+
+    return (new_law_refs, new_code_items, new_input_params, new_execution,
+            new_reasoning, new_legal_reasoning)
 
 
 _ARTICLE_HEADER_RE = re.compile(r"\b([A-Z]{2,})\s+Art\.?\s+(\d+\w*)\b")
