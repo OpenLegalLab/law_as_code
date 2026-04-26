@@ -211,7 +211,10 @@ def _merge_known_parameters(
             continue
 
         for param in law.get("input_parameters", []):
-            name = param.get("name", "")
+            if isinstance(param, str):
+                name = param
+            else:
+                name = param.get("name", "")
             if not name:
                 continue
             if name in known_parameters and law_extracted.get(name) is None:
@@ -448,6 +451,15 @@ async def run_pipeline(request: ClassifyRequest) -> ClassifyResponse:
     )
 
 
+def _is_numeric_string(s: str) -> bool:
+    """Return True if *s* can be parsed as a number."""
+    try:
+        float(s)
+        return True
+    except (ValueError, TypeError):
+        return False
+
+
 def _build_input_data(
     input_params: dict,
     period: str,
@@ -474,6 +486,10 @@ def _build_input_data(
             continue
         for key, value in params.items():
             if value is None:
+                continue
+            # Skip non-numeric placeholder strings the LLM sometimes generates
+            if isinstance(value, str) and not _is_numeric_string(value):
+                log.warning("Skipping non-numeric value for %r: %r", key, value)
                 continue
             if key not in tbs.variables:
                 log.warning("Skipping unknown variable %r (not in TBS %s)", key, system)
