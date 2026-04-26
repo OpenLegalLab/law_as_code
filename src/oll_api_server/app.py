@@ -10,6 +10,7 @@ from pathlib import Path
 import dspy
 from dotenv import load_dotenv
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from oll_api_server.config import settings
 from oll_api_server.pipeline import load_law_index, validate_law_index_variables
@@ -63,6 +64,14 @@ app = FastAPI(
     version="0.1.0",
     description="Classify legal cases, generate OpenFisca code, and execute it.",
     lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 app.include_router(health.router)

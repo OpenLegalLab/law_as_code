@@ -58,8 +58,9 @@ def validate_law_index_variables() -> None:
         if var not in tbs.variables:
             missing.append(f"{var} (not in {system})")
     if missing:
-        raise RuntimeError("Missing variables:\n  " + "\n  ".join(missing))
-    log.info("All law index variables validated against TBS")
+        log.warning("Missing variables (not yet in TBS):\n  %s", "\n  ".join(missing))
+    else:
+        log.info("All law index variables validated against TBS")
 
 
 def get_cached_laws() -> list[dict]:
