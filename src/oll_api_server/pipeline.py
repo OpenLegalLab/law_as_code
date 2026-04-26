@@ -17,10 +17,7 @@ from case_classifier.law_index import (
     get_law_by_reference,
 )
 
-from openfisca_switzerland import CountryTaxBenefitSystem
-from bern_stipendium.system import CountryTaxBenefitSystem as BernTaxBenefitSystem
-
-from oll_law_as_code.runner import run_variables, TBS_FACTORIES, _HOUSEHOLD_ROLES
+from oll_law_as_code.runner import run_variables, get_tbs, _HOUSEHOLD_ROLES
 
 from oll_api_server.i18n import (
     build_language_prefix,
@@ -39,17 +36,6 @@ log = logging.getLogger(__name__)
 # Module-level caches populated at startup
 _law_cache: list[dict] = []
 _law_index_prompt: str = ""
-_tbs_cache: dict[str, object] = {}
-
-
-def _get_tbs(system: str = "openfisca_switzerland"):
-    """Return a cached TaxBenefitSystem instance for the given system."""
-    if system not in _tbs_cache:
-        factory = TBS_FACTORIES.get(system)
-        if factory is None:
-            raise ValueError(f"Unknown system: {system!r}")
-        _tbs_cache[system] = factory()
-    return _tbs_cache[system]
 
 
 def load_law_index() -> None:
@@ -58,6 +44,22 @@ def load_law_index() -> None:
     _law_cache = get_all_laws()
     _law_index_prompt = format_law_index_for_prompt(_law_cache)
     log.info("Loaded %d laws into cache", len(_law_cache))
+
+
+def validate_law_index_variables() -> None:
+    """Verify every openfisca_variable in the law index exists in its TBS."""
+    missing = []
+    for law in _law_cache:
+        var = law.get("openfisca_variable")
+        if not var:
+            continue
+        system = law.get("system", "openfisca_switzerland")
+        tbs = get_tbs(system)
+        if var not in tbs.variables:
+            missing.append(f"{var} (not in {system})")
+    if missing:
+        raise RuntimeError("Missing variables:\n  " + "\n  ".join(missing))
+    log.info("All law index variables validated against TBS")
 
 
 def get_cached_laws() -> list[dict]:
@@ -90,7 +92,7 @@ def get_augmentation_fields(applicable_law_refs: list[str]) -> list[dict]:
 
         system = law.get("system", "openfisca_switzerland")
         try:
-            tbs = _get_tbs(system)
+            tbs = get_tbs(system)
         except ValueError:
             log.warning("Unknown TBS system %r for %r — skipping", system, ref)
             continue
@@ -186,6 +188,7 @@ def _run_execution(
         input_data=input_data,
         period=period,
         system=system,
+        tbs=get_tbs(system),
     )
 
 
@@ -344,7 +347,7 @@ def _build_input_data(
     if not input_params:
         return None
 
-    tbs = _get_tbs(system)
+    tbs = get_tbs(system)
     person_data: dict = {}
     household_data: dict = {}
     year = period[:4]
@@ -409,7 +412,7 @@ def _filter_inapplicable_laws(
     for var_name, value in execution.computed_values.items():
         sys_key = var_to_system.get(var_name, "openfisca_switzerland")
         try:
-            tbs = _get_tbs(sys_key)
+            tbs = get_tbs(sys_key)
             var_def = tbs.variables.get(var_name)
             if var_def is None:
                 continue

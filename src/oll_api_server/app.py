@@ -12,8 +12,9 @@ from dotenv import load_dotenv
 from fastapi import FastAPI
 
 from oll_api_server.config import settings
-from oll_api_server.pipeline import load_law_index
-from oll_api_server.routers import classify, health
+from oll_api_server.pipeline import load_law_index, validate_law_index_variables
+from oll_law_as_code.runner import warm_tbs_cache
+from oll_api_server.routers import augment, classify, health
 
 log = logging.getLogger(__name__)
 
@@ -50,6 +51,8 @@ async def lifespan(app: FastAPI):
 
     _configure_lm()
     load_law_index()
+    warm_tbs_cache()
+    validate_law_index_variables()
     log.info("Server ready")
 
     yield
@@ -64,3 +67,4 @@ app = FastAPI(
 
 app.include_router(health.router)
 app.include_router(classify.router)
+app.include_router(augment.router)

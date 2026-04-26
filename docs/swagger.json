@@ -1,0 +1,457 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "OLL Legal Case Classifier API",
+    "description": "Classify legal cases, generate OpenFisca code, and execute it.",
+    "version": "0.1.0"
+  },
+  "paths": {
+    "/api/v1/health": {
+      "get": {
+        "tags": [
+          "health"
+        ],
+        "summary": "Health",
+        "description": "Basic liveness check.",
+        "operationId": "health_api_v1_health_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Health Api V1 Health Get"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/laws": {
+      "get": {
+        "tags": [
+          "health"
+        ],
+        "summary": "List Laws",
+        "description": "Return the loaded law catalogue.",
+        "operationId": "list_laws_api_v1_laws_get",
+        "parameters": [
+          {
+            "name": "lang",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "enum": [
+                "en",
+                "de",
+                "fr",
+                "it"
+              ],
+              "type": "string",
+              "description": "Response language (for future translated metadata)",
+              "default": "en",
+              "title": "Lang"
+            },
+            "description": "Response language (for future translated metadata)"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": true
+                  },
+                  "title": "Response List Laws Api V1 Laws Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/classify": {
+      "post": {
+        "tags": [
+          "classify"
+        ],
+        "summary": "Classify",
+        "description": "Classify a legal case, generate OpenFisca code, and optionally execute it.",
+        "operationId": "classify_api_v1_classify_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ClassifyRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClassifyResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/augment": {
+      "post": {
+        "tags": [
+          "augment"
+        ],
+        "summary": "Augment",
+        "description": "Return all required input fields for the given applicable laws.",
+        "operationId": "augment_api_v1_augment_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AugmentRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/AugmentField"
+                  },
+                  "type": "array",
+                  "title": "Response Augment Api V1 Augment Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "AugmentField": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "full_name": {
+            "type": "string",
+            "title": "Full Name"
+          },
+          "value": {
+            "type": "integer",
+            "title": "Value",
+            "default": 0
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "full_name"
+        ],
+        "title": "AugmentField",
+        "description": "Single input field required by one or more applicable laws."
+      },
+      "AugmentRequest": {
+        "properties": {
+          "applicable_laws": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "minItems": 1,
+            "title": "Applicable Laws",
+            "description": "Article references from a prior classify response"
+          }
+        },
+        "type": "object",
+        "required": [
+          "applicable_laws"
+        ],
+        "title": "AugmentRequest",
+        "description": "Input payload for the augmentation endpoint."
+      },
+      "ClassifyRequest": {
+        "properties": {
+          "case_description": {
+            "type": "string",
+            "minLength": 1,
+            "title": "Case Description",
+            "description": "Natural language description of the legal case"
+          },
+          "execute": {
+            "type": "boolean",
+            "title": "Execute",
+            "description": "Whether to execute generated code after classification",
+            "default": true
+          },
+          "period": {
+            "type": "string",
+            "title": "Period",
+            "description": "OpenFisca simulation period (YYYY-MM)",
+            "default": "2024-01"
+          },
+          "language": {
+            "type": "string",
+            "enum": [
+              "en",
+              "de",
+              "fr",
+              "it"
+            ],
+            "title": "Language",
+            "description": "Response language for reasoning and error messages",
+            "default": "en"
+          }
+        },
+        "type": "object",
+        "required": [
+          "case_description"
+        ],
+        "title": "ClassifyRequest",
+        "description": "Input payload for the classification endpoint."
+      },
+      "ClassifyResponse": {
+        "properties": {
+          "syllogistic_reasoning": {
+            "type": "string",
+            "title": "Syllogistic Reasoning",
+            "default": ""
+          },
+          "legal_reasoning": {
+            "type": "string",
+            "title": "Legal Reasoning",
+            "default": ""
+          },
+          "applicable_laws": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Applicable Laws"
+          },
+          "input_parameters": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Input Parameters"
+          },
+          "code_generation": {
+            "items": {
+              "$ref": "#/components/schemas/CodeGenerationItem"
+            },
+            "type": "array",
+            "title": "Code Generation"
+          },
+          "execution": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ExecutionResult"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "processing_time_seconds": {
+            "type": "number",
+            "title": "Processing Time Seconds",
+            "default": 0.0
+          },
+          "stages_completed": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Stages Completed"
+          },
+          "error": {
+            "type": "string",
+            "title": "Error",
+            "default": ""
+          }
+        },
+        "type": "object",
+        "title": "ClassifyResponse",
+        "description": "Full pipeline response."
+      },
+      "CodeGenerationItem": {
+        "properties": {
+          "article_reference": {
+            "type": "string",
+            "title": "Article Reference"
+          },
+          "openfisca_variable": {
+            "type": "string",
+            "title": "Openfisca Variable",
+            "default": ""
+          },
+          "parameter_yaml": {
+            "type": "string",
+            "title": "Parameter Yaml",
+            "default": ""
+          },
+          "reasoning": {
+            "type": "string",
+            "title": "Reasoning",
+            "default": ""
+          },
+          "validation_passed": {
+            "type": "boolean",
+            "title": "Validation Passed",
+            "default": false
+          },
+          "attempts": {
+            "type": "integer",
+            "title": "Attempts",
+            "default": 0
+          },
+          "error": {
+            "type": "string",
+            "title": "Error",
+            "default": ""
+          }
+        },
+        "type": "object",
+        "required": [
+          "article_reference"
+        ],
+        "title": "CodeGenerationItem",
+        "description": "Result of code generation for a single law article."
+      },
+      "ExecutionResult": {
+        "properties": {
+          "success": {
+            "type": "boolean",
+            "title": "Success"
+          },
+          "computed_values": {
+            "additionalProperties": {
+              "type": "number"
+            },
+            "type": "object",
+            "title": "Computed Values"
+          },
+          "error": {
+            "type": "string",
+            "title": "Error",
+            "default": ""
+          },
+          "error_stage": {
+            "type": "string",
+            "title": "Error Stage",
+            "default": ""
+          }
+        },
+        "type": "object",
+        "required": [
+          "success"
+        ],
+        "title": "ExecutionResult",
+        "description": "Result of executing generated OpenFisca code."
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "type": "array",
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "title": "HTTPValidationError"
+      },
+      "ValidationError": {
+        "properties": {
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Location"
+          },
+          "msg": {
+            "type": "string",
+            "title": "Message"
+          },
+          "type": {
+            "type": "string",
+            "title": "Error Type"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "ctx": {
+            "type": "object",
+            "title": "Context"
+          }
+        },
+        "type": "object",
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError"
+      }
+    }
+  }
+}

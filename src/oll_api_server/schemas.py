@@ -7,6 +7,24 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 
+class AugmentRequest(BaseModel):
+    """Input payload for the augmentation endpoint."""
+
+    applicable_laws: list[str] = Field(
+        ...,
+        min_length=1,
+        description="Article references from a prior classify response",
+    )
+
+
+class AugmentField(BaseModel):
+    """Single input field required by one or more applicable laws."""
+
+    id: str
+    full_name: str
+    value: int = 0
+
+
 class ClassifyRequest(BaseModel):
     """Input payload for the classification endpoint."""
 
