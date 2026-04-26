@@ -1,0 +1,26 @@
+[project]
+name = "oll-api-server"
+version = "0.1.0"
+description = "REST API server for legal case classification and execution pipeline"
+requires-python = ">=3.10"
+dependencies = [
+    "case-classifier",
+    "oll-project-law-as-code",
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.34.0",
+    "pydantic-settings>=2.7.0",
+]
+
+[tool.uv.sources]
+case-classifier = { path = "oll_2026_law_as_code_case_classifier", editable = true }
+oll-project-law-as-code = { path = "oll_project_law_as_code", editable = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/oll_api_server"]
