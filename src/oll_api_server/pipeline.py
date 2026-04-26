@@ -575,7 +575,12 @@ def _infer_parameters_from_text(
 
     for ref in applicable_law_refs:
         law_params = input_params.get(ref)
-        if not isinstance(law_params, dict):
+        if law_params is None:
+            # LLM didn't return params for this ref — create empty dict so
+            # inference can fill it (critical when multiple laws share params)
+            law_params = {}
+            input_params[ref] = law_params
+        elif not isinstance(law_params, dict):
             continue
 
         # Phase 1: Correct impossible LLM values
