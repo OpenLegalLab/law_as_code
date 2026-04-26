@@ -29,6 +29,7 @@ from oll_api_server.schemas import (
     ClassifyResponse,
     CodeGenerationItem,
     ExecutionResult,
+    MissingParameter,
 )
 
 log = logging.getLogger(__name__)
@@ -114,6 +115,67 @@ def get_augmentation_fields(applicable_law_refs: list[str]) -> list[dict]:
             fields.append({"id": name, "full_name": label, "value": 0})
 
     return fields
+
+
+def _compute_missing_parameters(
+    applicable_law_refs: list[str],
+    extracted_params: dict,
+) -> list[MissingParameter]:
+    """Identify required parameters that the LLM could not extract.
+
+    For each applicable law, checks its ``input_parameters`` against the
+    values extracted by the classifier.  A parameter is considered missing
+    when it is absent or ``None`` in *extracted_params*.
+
+    Deduplicates by parameter ``id`` (same variable needed by multiple laws
+    keeps only the first occurrence).
+    """
+    seen: set[str] = set()
+    missing: list[MissingParameter] = []
+
+    for ref in applicable_law_refs:
+        law = get_law_by_reference(ref, _law_cache)
+        if law is None:
+            continue
+
+        law_extracted = extracted_params.get(ref, {})
+        if not isinstance(law_extracted, dict):
+            law_extracted = {}
+
+        system = law.get("system", "openfisca_switzerland")
+        try:
+            tbs = get_tbs(system)
+        except ValueError:
+            tbs = None
+
+        for param in law.get("input_parameters", []):
+            name = param.get("name", "")
+            if not name or name in seen:
+                continue
+
+            # Parameter present and non-null → not missing
+            if law_extracted.get(name) is not None:
+                continue
+
+            seen.add(name)
+
+            # Resolve human-readable description from TBS label, fallback to YAML
+            description = param.get("description", name)
+            if tbs is not None:
+                tbs_var = tbs.variables.get(name)
+                if tbs_var is not None and getattr(tbs_var, "label", None):
+                    description = tbs_var.label
+
+            param_type = param.get("type", "str")
+
+            missing.append(MissingParameter(
+                id=name,
+                type=param_type,
+                description=description,
+                law_reference=ref,
+            ))
+
+    return missing
 
 
 # ---------------------------------------------------------------------------
@@ -224,12 +286,16 @@ async def run_pipeline(request: ClassifyRequest) -> ClassifyResponse:
     legal_reasoning = _extract_legal_reasoning(filtered_reasoning, lang)
     stages.append("classification")
 
+    # Compute missing parameters (always, before execution)
+    missing_params = _compute_missing_parameters(applicable_law_refs, input_params)
+
     if not applicable_law_refs:
         return ClassifyResponse(
             syllogistic_reasoning=filtered_reasoning,
             legal_reasoning=legal_reasoning,
             applicable_laws=[],
             input_parameters=input_params,
+            missing_parameters=missing_params,
             stages_completed=stages,
             processing_time_seconds=time.monotonic() - start,
             error=translate_error("no_applicable_laws", lang),
@@ -326,6 +392,7 @@ async def run_pipeline(request: ClassifyRequest) -> ClassifyResponse:
         applicable_laws=applicable_law_refs,
         input_parameters=input_params,
         code_generation=code_items,
+        missing_parameters=missing_params,
         execution=execution,
         stages_completed=stages,
         processing_time_seconds=round(time.monotonic() - start, 2),
@@ -357,6 +424,8 @@ def _build_input_data(
         if not isinstance(params, dict):
             continue
         for key, value in params.items():
+            if value is None:
+                continue
             if key not in tbs.variables:
                 log.warning("Skipping unknown variable %r (not in TBS %s)", key, system)
                 continue

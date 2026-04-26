@@ -43,6 +43,15 @@ class ClassifyRequest(BaseModel):
     )
 
 
+class MissingParameter(BaseModel):
+    """A required input parameter that the LLM could not extract from the case."""
+
+    id: str
+    type: str
+    description: str
+    law_reference: str
+
+
 class CodeGenerationItem(BaseModel):
     """Result of code generation for a single law article."""
 
@@ -72,6 +81,7 @@ class ClassifyResponse(BaseModel):
     applicable_laws: list[str] = Field(default_factory=list)
     input_parameters: dict[str, Any] = Field(default_factory=dict)
     code_generation: list[CodeGenerationItem] = Field(default_factory=list)
+    missing_parameters: list[MissingParameter] = Field(default_factory=list)
     execution: ExecutionResult | None = None
     processing_time_seconds: float = 0.0
     stages_completed: list[str] = Field(default_factory=list)
