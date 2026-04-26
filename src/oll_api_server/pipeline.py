@@ -149,7 +149,16 @@ def _compute_missing_parameters(
             tbs = None
 
         for param in law.get("input_parameters", []):
-            name = param.get("name", "")
+            # Handle both dict entries and plain string entries
+            if isinstance(param, str):
+                name = param
+                description = param
+                param_type = "str"
+            else:
+                name = param.get("name", "")
+                description = param.get("description", name)
+                param_type = param.get("type", "str")
+
             if not name or name in seen:
                 continue
 
@@ -160,13 +169,10 @@ def _compute_missing_parameters(
             seen.add(name)
 
             # Resolve human-readable description from TBS label, fallback to YAML
-            description = param.get("description", name)
             if tbs is not None:
                 tbs_var = tbs.variables.get(name)
                 if tbs_var is not None and getattr(tbs_var, "label", None):
                     description = tbs_var.label
-
-            param_type = param.get("type", "str")
 
             missing.append(MissingParameter(
                 id=name,
