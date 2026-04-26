@@ -41,6 +41,11 @@ class ClassifyRequest(BaseModel):
         default="en",
         description="Response language for reasoning and error messages",
     )
+    known_parameters: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Previously collected parameter values to merge with LLM-extracted ones. "
+        "Keyed by variable name (e.g. {\"age\": 45, \"has_swiss_residence\": true}).",
+    )
 
 
 class MissingParameter(BaseModel):

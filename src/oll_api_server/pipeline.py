@@ -184,6 +184,42 @@ def _compute_missing_parameters(
     return missing
 
 
+def _merge_known_parameters(
+    input_params: dict,
+    known_parameters: dict[str, object],
+    applicable_law_refs: list[str],
+) -> dict:
+    """Merge client-provided *known_parameters* into LLM-extracted *input_params*.
+
+    *known_parameters* is a flat dict keyed by OpenFisca variable name.  For
+    each applicable law, if a required parameter name appears in
+    *known_parameters* but is absent/None in the extracted params, inject it.
+    """
+    if not known_parameters:
+        return input_params
+
+    for ref in applicable_law_refs:
+        law = get_law_by_reference(ref, _law_cache)
+        if law is None:
+            continue
+
+        law_extracted = input_params.get(ref)
+        if law_extracted is None:
+            law_extracted = {}
+            input_params[ref] = law_extracted
+        elif not isinstance(law_extracted, dict):
+            continue
+
+        for param in law.get("input_parameters", []):
+            name = param.get("name", "")
+            if not name:
+                continue
+            if name in known_parameters and law_extracted.get(name) is None:
+                law_extracted[name] = known_parameters[name]
+
+    return input_params
+
+
 # ---------------------------------------------------------------------------
 # Parsing helpers (moved from case_classifier main.py)
 # ---------------------------------------------------------------------------
@@ -292,7 +328,12 @@ async def run_pipeline(request: ClassifyRequest) -> ClassifyResponse:
     legal_reasoning = _extract_legal_reasoning(filtered_reasoning, lang)
     stages.append("classification")
 
-    # Compute missing parameters (always, before execution)
+    # Merge client-provided known_parameters into LLM-extracted values
+    input_params = _merge_known_parameters(
+        input_params, request.known_parameters, applicable_law_refs
+    )
+
+    # Compute missing parameters (before execution, may be recomputed after filtering)
     missing_params = _compute_missing_parameters(applicable_law_refs, input_params)
 
     if not applicable_law_refs:
@@ -391,6 +432,8 @@ async def run_pipeline(request: ClassifyRequest) -> ClassifyResponse:
             variable_mappings,
             lang,
         )
+        # Recompute missing params so filtered-out laws don't contribute
+        missing_params = _compute_missing_parameters(applicable_law_refs, input_params)
 
     return ClassifyResponse(
         syllogistic_reasoning=filtered_reasoning,
