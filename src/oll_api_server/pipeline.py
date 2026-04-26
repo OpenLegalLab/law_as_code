@@ -100,7 +100,12 @@ def get_augmentation_fields(applicable_law_refs: list[str]) -> list[dict]:
             continue
 
         for param in law.get("input_parameters", []):
-            name = param.get("name", "")
+            if isinstance(param, str):
+                name = param
+                description = param
+            else:
+                name = param.get("name", "")
+                description = param.get("description", name)
             if not name or name in seen:
                 continue
             seen.add(name)
@@ -109,7 +114,7 @@ def get_augmentation_fields(applicable_law_refs: list[str]) -> list[dict]:
             label = (
                 tbs_var.label
                 if tbs_var is not None and getattr(tbs_var, "label", None)
-                else param.get("description", name)
+                else description
             )
 
             fields.append({"id": name, "full_name": label, "value": 0})
@@ -460,6 +465,85 @@ def _is_numeric_string(s: str) -> bool:
         return False
 
 
+# Domain-specific keyword → enum key mappings for common LLM paraphrases
+_ENUM_KEYWORD_MAP: dict[str, dict[str, str]] = {
+    "ausbildungsstufe": {
+        "university": "tertiaerstufe",
+        "universität": "tertiaerstufe",
+        "hochschule": "tertiaerstufe",
+        "fachhochschule": "tertiaerstufe",
+        "tertiary": "tertiaerstufe",
+        "tertiär": "tertiaerstufe",
+        "secondary": "sekundarstufe_ii",
+        "gymnasium": "sekundarstufe_ii",
+        "lehre": "sekundarstufe_ii",
+        "apprenticeship": "sekundarstufe_ii",
+    },
+    "ausbildungstyp": {
+        "university": "erstausbildung",
+        "first degree": "erstausbildung",
+        "bachelor": "erstausbildung",
+        "master": "erstausbildung",
+        "studies": "erstausbildung",
+        "studium": "erstausbildung",
+        "first": "erstausbildung",
+        "second degree": "zweitausbildung",
+        "retraining": "umschulung",
+        "further education": "weiterbildung",
+    },
+    "wohnsitz_grundlage": {
+        "bern": "elterlicher_wohnsitz",
+        "parents": "elterlicher_wohnsitz",
+        "eltern": "elterlicher_wohnsitz",
+        "orphan": "elternlos",
+        "abroad": "eltern_im_ausland",
+        "independent": "finanziell_unabhaengig",
+        "refugee": "fluechtling_staatenlos",
+    },
+    "staatsangehoerigkeit": {
+        "swiss": "schweizer",
+        "schweiz": "schweizer",
+        "eu": "eu_efta_niederlassung",
+        "efta": "eu_efta_niederlassung",
+        "permit b": "aufenthaltsbewilligung_b",
+        "b permit": "aufenthaltsbewilligung_b",
+        "refugee": "fluechtling_staatenlos",
+    },
+}
+
+
+def _fuzzy_match_enum(value: str, members: dict, variable_name: str = "") -> str | None:
+    """Try to map a descriptive LLM string to a valid enum member name.
+
+    Uses domain-specific keyword mappings first, then falls back to
+    substring matching against member names.
+    """
+    lower = value.lower().strip()
+
+    # Direct case-insensitive match
+    for name in members:
+        if lower == name.lower():
+            return name
+
+    # Domain-specific keyword mapping
+    kw_map = _ENUM_KEYWORD_MAP.get(variable_name, {})
+    for keyword, target in kw_map.items():
+        if keyword in lower and target in members:
+            return target
+
+    # Check if any member name is contained in the value
+    for name in members:
+        if name.lower() in lower:
+            return name
+
+    # Check if the value is contained in any member name
+    for name in members:
+        if lower in name.lower():
+            return name
+
+    return None
+
+
 def _build_input_data(
     input_params: dict,
     period: str,
@@ -487,14 +571,34 @@ def _build_input_data(
         for key, value in params.items():
             if value is None:
                 continue
-            # Skip non-numeric placeholder strings the LLM sometimes generates
-            if isinstance(value, str) and not _is_numeric_string(value):
-                log.warning("Skipping non-numeric value for %r: %r", key, value)
-                continue
             if key not in tbs.variables:
                 log.warning("Skipping unknown variable %r (not in TBS %s)", key, system)
                 continue
             var = tbs.variables[key]
+
+            # Handle Enum variables: accept valid enum member names
+            if isinstance(value, str) and not _is_numeric_string(value):
+                possible = getattr(var, "possible_values", None)
+                if possible is not None and hasattr(possible, "__members__"):
+                    if value in possible.__members__:
+                        pass  # already a valid enum key
+                    else:
+                        # Try fuzzy matching for LLM-provided descriptive values
+                        matched = _fuzzy_match_enum(value, possible.__members__, variable_name=key)
+                        if matched:
+                            log.info("Fuzzy-matched enum %r -> %r for %r", value, matched, key)
+                            value = matched
+                        else:
+                            log.warning(
+                                "Skipping invalid enum value for %r: %r (valid: %s)",
+                                key, value, list(possible.__members__),
+                            )
+                            continue
+                else:
+                    # Not an Enum variable — skip non-numeric strings
+                    log.warning("Skipping non-numeric value for %r: %r", key, value)
+                    continue
+
             period_key = year if str(var.definition_period).upper() == "YEAR" else period
 
             # Household-level variables (e.g. eltern_anrechenbare_mittel)
