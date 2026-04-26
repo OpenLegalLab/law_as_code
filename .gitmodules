@@ -4,3 +4,6 @@
 [submodule "oll_project_law_as_code"]
 	path = oll_project_law_as_code
 	url = git@github.com:benjamin-arfa/oll_2026_law_as_code.git
+[submodule "OLL_Chatbox"]
+	path = OLL_Chatbox
+	url = git@github.com:mfpa231/OLL_Chatbox.git
