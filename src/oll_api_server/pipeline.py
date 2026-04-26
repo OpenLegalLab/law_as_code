@@ -122,6 +122,47 @@ def get_augmentation_fields(applicable_law_refs: list[str]) -> list[dict]:
     return fields
 
 
+# ---------------------------------------------------------------------------
+# Conditional dependency rules — parameters that are only required when
+# another parameter has a specific value.  Format:
+#   param_name -> (dependency_param, required_value)
+# The parameter is skipped (not flagged as missing) when the dependency
+# parameter has a known value that differs from *required_value*.
+# If the dependency is itself unknown (None), we conservatively still ask.
+# ---------------------------------------------------------------------------
+_CONDITIONAL_DEPENDENCIES: dict[str, tuple[str, object]] = {
+    # Quality assurance only matters for private institutions
+    "private_ausbildungsstaette_qualitaetsgesichert": ("private_ausbildungsstaette", True),
+    # Age-limit exceptions only matter when applicant is >= 35
+    "beruflicher_wiedereinstieg_nach_familienphase": ("alter", "_age_gte_35"),
+    "wichtige_gruende_altersausnahme": ("alter", "_age_gte_35"),
+}
+
+
+def _condition_satisfied(
+    law_extracted: dict,
+    dep_param: str,
+    required_value: object,
+) -> bool:
+    """Return True if the conditional dependency is satisfied (= param IS required).
+
+    Returns True (conservatively ask) when the dependency value is unknown.
+    """
+    dep_value = law_extracted.get(dep_param)
+    if dep_value is None:
+        # Dependency unknown — conservatively treat as required
+        return True
+
+    # Special sentinel: age >= 35
+    if required_value == "_age_gte_35":
+        try:
+            return int(dep_value) >= 35
+        except (ValueError, TypeError):
+            return True  # can't parse → ask to be safe
+
+    return dep_value == required_value
+
+
 def _compute_missing_parameters(
     applicable_law_refs: list[str],
     extracted_params: dict,
@@ -131,6 +172,10 @@ def _compute_missing_parameters(
     For each applicable law, checks its ``input_parameters`` against the
     values extracted by the classifier.  A parameter is considered missing
     when it is absent or ``None`` in *extracted_params*.
+
+    Parameters with conditional dependencies (e.g. quality assurance is only
+    relevant for private institutions) are skipped when their dependency
+    condition is not met.
 
     Deduplicates by parameter ``id`` (same variable needed by multiple laws
     keeps only the first occurrence).
@@ -170,6 +215,17 @@ def _compute_missing_parameters(
             # Parameter present and non-null → not missing
             if law_extracted.get(name) is not None:
                 continue
+
+            # Check conditional dependencies — skip if dependency says not required
+            cond = _CONDITIONAL_DEPENDENCIES.get(name)
+            if cond is not None:
+                dep_param, required_value = cond
+                if not _condition_satisfied(law_extracted, dep_param, required_value):
+                    log.debug(
+                        "Skipping conditional param %r (dependency %r not met) for %s",
+                        name, dep_param, ref,
+                    )
+                    continue
 
             seen.add(name)
 
