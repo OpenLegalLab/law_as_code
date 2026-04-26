@@ -55,6 +55,7 @@ class MissingParameter(BaseModel):
     type: str
     description: str
     law_reference: str
+    allowed_values: list[str] | None = None
 
 
 class CodeGenerationItem(BaseModel):

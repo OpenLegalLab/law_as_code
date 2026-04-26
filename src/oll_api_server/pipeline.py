@@ -235,11 +235,25 @@ def _compute_missing_parameters(
                 if tbs_var is not None and getattr(tbs_var, "label", None):
                     description = tbs_var.label
 
+            # Resolve allowed_values: prefer YAML, fall back to TBS enum members
+            allowed_values = None
+            if isinstance(param, dict) and param.get("allowed_values"):
+                allowed_values = param["allowed_values"]
+            elif param_type == "bool":
+                allowed_values = ["true", "false"]
+            elif tbs is not None:
+                tbs_var = tbs.variables.get(name)
+                if tbs_var is not None:
+                    possible = getattr(tbs_var, "possible_values", None)
+                    if possible is not None and hasattr(possible, "__members__"):
+                        allowed_values = list(possible.__members__.keys())
+
             missing.append(MissingParameter(
                 id=name,
                 type=param_type,
                 description=description,
                 law_reference=ref,
+                allowed_values=allowed_values,
             ))
 
     return missing
