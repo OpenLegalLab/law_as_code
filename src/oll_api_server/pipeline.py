@@ -336,6 +336,11 @@ async def run_pipeline(request: ClassifyRequest) -> ClassifyResponse:
     legal_reasoning = _extract_legal_reasoning(filtered_reasoning, lang)
     stages.append("classification")
 
+    # Deterministic post-classification inference: fill obvious nulls from text
+    input_params = _infer_parameters_from_text(
+        request.case_description, input_params, applicable_law_refs
+    )
+
     # Merge client-provided known_parameters into LLM-extracted values
     input_params = _merge_known_parameters(
         input_params, request.known_parameters, applicable_law_refs
@@ -463,6 +468,115 @@ def _is_numeric_string(s: str) -> bool:
         return True
     except (ValueError, TypeError):
         return False
+
+
+# ---------------------------------------------------------------------------
+# Post-classification inference — deterministically fill obvious nulls
+# ---------------------------------------------------------------------------
+
+# Maps: keyword in case text → (parameter_name, inferred_value)
+_INFERENCE_RULES: list[tuple[list[str], str, str]] = [
+    # wohnsitz_grundlage: "living in Bern" / "wohne in Bern" → elterlicher_wohnsitz (default for students)
+    (["living in bern", "wohne in bern", "wohnhaft in bern", "live in bern", "berner", "kanton bern"],
+     "wohnsitz_grundlage", "elterlicher_wohnsitz"),
+    # staatsangehoerigkeit: assume Swiss if not specified and in Bern
+    (["swiss", "schweizer", "schweizerin"], "staatsangehoerigkeit", "schweizer"),
+    # ausbildungstyp: "university studies" / "studium" without "second" / "zweit" → erstausbildung
+    (["university studies", "uni studies", "studium", "bachelor", "studies at university",
+      "my studies", "höhere ausbildung", "my university"],
+     "ausbildungstyp", "erstausbildung"),
+    # ausbildungsstufe: university → tertiaerstufe
+    (["university", "uni", "hochschule", "fachhochschule", "eth", "universität"],
+     "ausbildungsstufe", "tertiaerstufe"),
+    # ausbildungsstaette_anerkannt: university is always recognised
+    (["university", "uni", "hochschule", "fachhochschule", "eth", "universität"],
+     "ausbildungsstaette_anerkannt", True),
+    # private_ausbildungsstaette: university is typically public
+    (["university", "uni", "hochschule", "eth", "universität"],
+     "private_ausbildungsstaette", False),
+]
+
+# Negative keywords that BLOCK an inference (e.g., "second degree" blocks erstausbildung)
+_INFERENCE_BLOCKERS: dict[str, list[str]] = {
+    "ausbildungstyp:erstausbildung": [
+        "second degree", "zweite ausbildung", "zweitausbildung", "second university",
+        "already have a degree", "bereits ein studium", "retraining", "umschulung",
+    ],
+}
+
+
+def _infer_parameters_from_text(
+    case_description: str,
+    input_params: dict,
+    applicable_law_refs: list[str],
+) -> dict:
+    """Fill obvious null parameters and correct impossible values using deterministic keyword matching.
+
+    Phase 1: Correct values the LLM picked that contradict the case text.
+    Phase 2: Fill null values that can be inferred from keywords.
+    """
+    lower_text = case_description.lower()
+
+    for ref in applicable_law_refs:
+        law_params = input_params.get(ref)
+        if not isinstance(law_params, dict):
+            continue
+
+        # Phase 1: Correct impossible LLM values
+        _correct_impossible_values(lower_text, law_params, ref)
+
+        # Phase 2: Fill nulls from keywords
+        for keywords, param_name, value in _INFERENCE_RULES:
+            # Skip if already filled
+            if law_params.get(param_name) is not None:
+                continue
+
+            # Check if any keyword matches
+            matched = any(kw in lower_text for kw in keywords)
+            if not matched:
+                continue
+
+            # Check blockers
+            blocker_key = f"{param_name}:{value}"
+            blockers = _INFERENCE_BLOCKERS.get(blocker_key, [])
+            if any(b in lower_text for b in blockers):
+                continue
+
+            law_params[param_name] = value
+            log.info("Inferred %s=%r from case text for %s", param_name, value, ref)
+
+    return input_params
+
+
+# Corrections: (current_value, required_keywords_absent, replacement)
+# If current value is X and NONE of the required keywords are present → replace with default
+_CORRECTION_RULES: list[tuple[str, str, list[str], str]] = [
+    # zweite_hochschulausbildung requires evidence of a prior completed degree
+    ("ausbildungstyp", "zweite_hochschulausbildung",
+     ["second degree", "second university", "already completed", "bereits abgeschlossen",
+      "zweites studium", "zweite hochschul", "already have a degree"],
+     "erstausbildung"),
+    # zweitausbildung requires evidence of a completed prior training
+    ("ausbildungstyp", "zweitausbildung",
+     ["second training", "zweite ausbildung", "already completed", "bereits abgeschlossen",
+      "second profession"],
+     "erstausbildung"),
+]
+
+
+def _correct_impossible_values(lower_text: str, law_params: dict, ref: str) -> None:
+    """Override LLM-extracted values that are logically impossible given the case text."""
+    for param_name, wrong_value, evidence_keywords, replacement in _CORRECTION_RULES:
+        current = law_params.get(param_name)
+        if current != wrong_value:
+            continue
+        # If NONE of the evidence keywords are present, the LLM guessed wrong
+        if not any(kw in lower_text for kw in evidence_keywords):
+            log.info(
+                "Corrected %s: %r → %r (no supporting evidence in text) for %s",
+                param_name, wrong_value, replacement, ref,
+            )
+            law_params[param_name] = replacement
 
 
 # Domain-specific keyword → enum key mappings for common LLM paraphrases
