@@ -24,7 +24,7 @@ class Settings(BaseSettings):
     port: int = 8000
     request_timeout_seconds: int = 120
 
-    model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
+    model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 
 
 settings = Settings()
