@@ -56,6 +56,16 @@ class MissingParameter(BaseModel):
     description: str
     law_reference: str
     allowed_values: list[str] | None = None
+    priority: Literal["required", "recommended", "optional"] = "recommended"
+    prompt_question: str = ""
+
+
+class PipelineWarning(BaseModel):
+    """A warning about approximations or assumptions made during computation."""
+
+    code: str
+    message: str
+    details: str = ""
 
 
 class CodeGenerationItem(BaseModel):
@@ -88,6 +98,12 @@ class ClassifyResponse(BaseModel):
     input_parameters: dict[str, Any] = Field(default_factory=dict)
     code_generation: list[CodeGenerationItem] = Field(default_factory=list)
     missing_parameters: list[MissingParameter] = Field(default_factory=list)
+    user_action_required: bool = Field(
+        default=False,
+        description="True when critical parameters are missing and the result "
+        "is computed with defaults. Frontend should prompt the user.",
+    )
+    warnings: list[PipelineWarning] = Field(default_factory=list)
     execution: ExecutionResult | None = None
     processing_time_seconds: float = 0.0
     stages_completed: list[str] = Field(default_factory=list)

@@ -16,6 +16,7 @@ from oll_api_server.config import settings
 from oll_api_server.pipeline import load_law_index, validate_law_index_variables, warm_tbs_cache
 from oll_api_server.routers import augment, classify, health
 
+logging.basicConfig(level=logging.INFO, format="%(name)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]

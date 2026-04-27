@@ -30,6 +30,7 @@ from oll_api_server.schemas import (
     CodeGenerationItem,
     ExecutionResult,
     MissingParameter,
+    PipelineWarning,
 )
 
 log = logging.getLogger(__name__)
@@ -48,6 +49,61 @@ _HOUSEHOLD_ROLES: dict[str, str] = {
 }
 
 _tbs_cache: dict[str, object] = {}
+
+
+def _norm_dashes(s: str) -> str:
+    """Normalise en-dash/em-dash to plain hyphen for robust matching."""
+    return s.replace("\u2013", "-").replace("\u2014", "-")
+
+# ---------------------------------------------------------------------------
+# Parameter name aliases — maps common LLM-generated names to OpenFisca vars
+# ---------------------------------------------------------------------------
+_PARAMETER_ALIASES: dict[str, str] = {
+    # ABG / Stipendium aliases
+    "ausbildungskosten_pro_jahr": "anerkannte_ausbildungskosten",
+    "ausbildungskosten": "anerkannte_ausbildungskosten",
+    "kosten_ausbildung": "anerkannte_ausbildungskosten",
+    "studienkosten": "anerkannte_ausbildungskosten",
+    "einkommen_steuerbares": "eigene_anrechenbare_mittel",
+    "eigenes_einkommen": "eigene_anrechenbare_mittel",
+    "einkommen": "eigene_anrechenbare_mittel",
+    "eigene_mittel": "eigene_anrechenbare_mittel",
+    "eltern_einkommen_steuerbares": "eltern_anrechenbare_mittel",
+    "eltern_einkommen": "eltern_anrechenbare_mittel",
+    "einkommen_eltern": "eltern_anrechenbare_mittel",
+    "eltern_mittel": "eltern_anrechenbare_mittel",
+    "age": "alter",
+    "wohnsitz": "wohnsitz_grundlage",
+    "nationalitaet": "staatsangehoerigkeit",
+    "nationality": "staatsangehoerigkeit",
+    "citizenship": "staatsangehoerigkeit",
+    "education_type": "ausbildungstyp",
+    "education_level": "ausbildungsstufe",
+    "years_employment": "jahre_vollerwerbstaetigkeit",
+    "arbeitsjahre": "jahre_vollerwerbstaetigkeit",
+    "ausbildungsjahr": "aktuelles_ausbildungsjahr",
+    "current_year_of_study": "aktuelles_ausbildungsjahr",
+    "total_years_education": "kumulierte_ausbildungsjahre",
+    "gesamte_ausbildungsjahre": "kumulierte_ausbildungsjahre",
+}
+
+# ---------------------------------------------------------------------------
+# Gross income → anrechenbare Mittel conversion
+# ---------------------------------------------------------------------------
+# When users say "my parents earn X" the LLM extracts gross income, but
+# OpenFisca expects *anrechenbare Mittel* (countable resources after
+# deductions for taxes, social contributions, and living expenses).
+# We apply a rough conversion factor and flag a warning.
+#
+# Source alias names that represent GROSS income (not yet countable resources):
+_GROSS_INCOME_ALIASES: set[str] = {
+    "eltern_einkommen", "einkommen_eltern", "eltern_einkommen_steuerbares",
+    "eigenes_einkommen", "eigenes_einkommen_brutto", "einkommen",
+}
+# Approximate factor: gross income → anrechenbare Mittel
+# Bern practice: ~70% of gross income is used as a rough estimate for
+# countable resources (after taxes, AHV/IV/EO, pension contributions).
+_GROSS_TO_ANRECHENBAR_FACTOR: float = 0.70
 
 
 def get_tbs(system: str = "openfisca_switzerland"):
@@ -224,6 +280,82 @@ _CONDITIONAL_DEPENDENCIES: dict[str, tuple[str, object]] = {
     "wichtige_gruende_altersausnahme": ("alter", "_age_gte_35"),
 }
 
+# ---------------------------------------------------------------------------
+# Parameter priority and prompt questions for missing parameter prompting
+# ---------------------------------------------------------------------------
+# "required" = critical for computation, result is unreliable without it
+# "recommended" = improves accuracy, has reasonable defaults
+# "optional" = edge-case parameter, rarely changes outcome
+_PARAMETER_PRIORITY: dict[str, str] = {
+    # Required — financial parameters that directly determine the result
+    "anerkannte_ausbildungskosten": "required",
+    "eigene_anrechenbare_mittel": "required",
+    "eltern_anrechenbare_mittel": "required",
+    "alter": "required",
+    # Recommended — affect eligibility but have common defaults
+    "wohnsitz_grundlage": "recommended",
+    "staatsangehoerigkeit": "recommended",
+    "ausbildungstyp": "recommended",
+    "ausbildungsstufe": "recommended",
+    "ausbildungsstaette_anerkannt": "recommended",
+    # Optional — edge-case parameters
+    "kumulierte_ausbildungsjahre": "optional",
+    "aktuelles_ausbildungsjahr": "optional",
+    "jahre_vollerwerbstaetigkeit": "optional",
+    "private_ausbildungsstaette": "optional",
+    "private_ausbildungsstaette_qualitaetsgesichert": "optional",
+    "beruflicher_wiedereinstieg_nach_familienphase": "optional",
+    "wichtige_gruende_altersausnahme": "optional",
+}
+
+# Human-friendly prompt questions (multilingual: en, de)
+_PROMPT_QUESTIONS: dict[str, dict[str, str]] = {
+    "anerkannte_ausbildungskosten": {
+        "en": "What are your annual education and living costs (in CHF)?",
+        "de": "Wie hoch sind Ihre jährlichen Ausbildungs- und Lebenshaltungskosten (in CHF)?",
+    },
+    "eigene_anrechenbare_mittel": {
+        "en": "What is your own annual income and assets (in CHF)?",
+        "de": "Wie hoch sind Ihre eigenen anrechenbaren Mittel pro Jahr (Einkommen + Vermögen, in CHF)?",
+    },
+    "eltern_anrechenbare_mittel": {
+        "en": "What are your parents' countable resources (income + assets after deductions, in CHF)?",
+        "de": "Wie hoch sind die anrechenbaren Mittel Ihrer Eltern (Einkommen + Vermögen nach Abzügen, in CHF)?",
+    },
+    "alter": {
+        "en": "How old are you?",
+        "de": "Wie alt sind Sie?",
+    },
+    "wohnsitz_grundlage": {
+        "en": "What is the basis for your residence in Bern? (e.g., parents live in Bern, own residence, etc.)",
+        "de": "Auf welcher Grundlage haben Sie Ihren stipendienrechtlichen Wohnsitz in Bern?",
+    },
+    "staatsangehoerigkeit": {
+        "en": "What is your nationality / residence permit status?",
+        "de": "Was ist Ihre Staatsangehörigkeit / Aufenthaltsstatus?",
+    },
+    "ausbildungstyp": {
+        "en": "What type of education are you pursuing? (e.g., first degree, second degree, vocational training)",
+        "de": "Welche Art von Ausbildung absolvieren Sie? (z.B. Erstausbildung, Zweitausbildung)",
+    },
+    "ausbildungsstufe": {
+        "en": "What education level? (secondary II or tertiary)",
+        "de": "Welche Ausbildungsstufe? (Sekundarstufe II oder Tertiärstufe)",
+    },
+    "ausbildungsstaette_anerkannt": {
+        "en": "Is your educational institution recognized by the canton?",
+        "de": "Ist Ihre Ausbildungsstätte vom Kanton anerkannt?",
+    },
+    "kumulierte_ausbildungsjahre": {
+        "en": "How many years of education have you already received scholarship support for?",
+        "de": "Für wie viele Ausbildungsjahre haben Sie bereits Beiträge erhalten?",
+    },
+    "aktuelles_ausbildungsjahr": {
+        "en": "What year of your current education are you in? (1st, 2nd, 3rd, ...)",
+        "de": "Im wievielten Ausbildungsjahr befinden Sie sich?",
+    },
+}
+
 
 def _condition_satisfied(
     law_extracted: dict,
@@ -252,6 +384,7 @@ def _condition_satisfied(
 def _compute_missing_parameters(
     applicable_law_refs: list[str],
     extracted_params: dict,
+    language: str = "en",
 ) -> list[MissingParameter]:
     """Identify required parameters that the LLM could not extract.
 
@@ -265,6 +398,9 @@ def _compute_missing_parameters(
 
     Deduplicates by parameter ``id`` (same variable needed by multiple laws
     keeps only the first occurrence).
+
+    Each missing parameter is annotated with a ``priority`` (required /
+    recommended / optional) and a ``prompt_question`` for frontend display.
     """
     seen: set[str] = set()
     missing: list[MissingParameter] = []
@@ -334,13 +470,26 @@ def _compute_missing_parameters(
                     if possible is not None and hasattr(possible, "__members__"):
                         allowed_values = list(possible.__members__.keys())
 
+            # Priority and prompt question
+            priority = _PARAMETER_PRIORITY.get(name, "recommended")
+            prompt_q = ""
+            if name in _PROMPT_QUESTIONS:
+                lang_key = language if language in _PROMPT_QUESTIONS[name] else "en"
+                prompt_q = _PROMPT_QUESTIONS[name].get(lang_key, "")
+
             missing.append(MissingParameter(
                 id=name,
                 type=param_type,
                 description=description,
                 law_reference=ref,
                 allowed_values=allowed_values,
+                priority=priority,
+                prompt_question=prompt_q,
             ))
+
+    # Sort: required first, then recommended, then optional
+    priority_order = {"required": 0, "recommended": 1, "optional": 2}
+    missing.sort(key=lambda p: priority_order.get(p.priority, 1))
 
     return missing
 
@@ -365,7 +514,7 @@ def _merge_known_parameters(
         if not law:
             for candidate in _law_cache:
                 art_ref = candidate["article_reference"]
-                if ref.startswith(art_ref) or art_ref.startswith(ref):
+                if _norm_dashes(ref).startswith(_norm_dashes(art_ref)) or _norm_dashes(art_ref).startswith(_norm_dashes(ref)):
                     law = candidate
                     break
         if law is None:
@@ -389,6 +538,38 @@ def _merge_known_parameters(
                 law_extracted[name] = known_parameters[name]
 
     return input_params
+
+
+# ---------------------------------------------------------------------------
+# Companion law groups — laws that should always be evaluated together
+# ---------------------------------------------------------------------------
+_COMPANION_LAWS: list[list[str]] = [
+    ["ABG Art. 1-16", "ABG Art. 10/16"],  # Eligibility + Amount
+]
+
+
+def _ensure_companion_laws(applicable_law_refs: list[str]) -> list[str]:
+    """If one law from a companion group is present, ensure all are included."""
+    refs = list(applicable_law_refs)
+    # Resolve each ref to its canonical article_reference for matching
+    resolved: dict[str, str] = {}
+    for ref in refs:
+        for candidate in _law_cache:
+            art_ref = candidate["article_reference"]
+            if _norm_dashes(ref) == _norm_dashes(art_ref) or _norm_dashes(ref).startswith(_norm_dashes(art_ref)) or _norm_dashes(art_ref).startswith(_norm_dashes(ref)):
+                resolved[ref] = art_ref
+                break
+
+    present_canonical = set(resolved.values())
+
+    for group in _COMPANION_LAWS:
+        if present_canonical & set(group):
+            for companion_ref in group:
+                if companion_ref not in present_canonical:
+                    refs.append(companion_ref)
+                    present_canonical.add(companion_ref)
+                    log.info("Auto-included companion law %r", companion_ref)
+    return refs
 
 
 # ---------------------------------------------------------------------------
@@ -444,7 +625,7 @@ def _lookup_variables(applicable_law_refs: list[str]) -> list[dict]:
         if not law:
             for candidate in _law_cache:
                 art_ref = candidate["article_reference"]
-                if ref.startswith(art_ref) or art_ref.startswith(ref):
+                if _norm_dashes(ref).startswith(_norm_dashes(art_ref)) or _norm_dashes(art_ref).startswith(_norm_dashes(ref)):
                     law = candidate
                     break
         if law and law.get("openfisca_variable"):
@@ -529,6 +710,11 @@ async def run_pipeline(request: ClassifyRequest) -> ClassifyResponse:
             applicable_law_refs.append(art)
             existing_norm.add(art)
 
+    # Auto-include companion laws (e.g. ABG eligibility + amount always together)
+    log.info("Before companion check: %s", applicable_law_refs)
+    applicable_law_refs = _ensure_companion_laws(applicable_law_refs)
+    log.info("After companion check: %s", applicable_law_refs)
+
     filtered_reasoning = _filter_reasoning_by_applicable_laws(
         result.syllogistic_reasoning, applicable_law_refs
     )
@@ -548,7 +734,10 @@ async def run_pipeline(request: ClassifyRequest) -> ClassifyResponse:
     )
 
     # Compute missing parameters (before execution, may be recomputed after filtering)
-    missing_params = _compute_missing_parameters(applicable_law_refs, input_params)
+    missing_params = _compute_missing_parameters(applicable_law_refs, input_params, lang)
+
+    # Track warnings collected during the pipeline
+    pipeline_warnings: list[PipelineWarning] = []
 
     if not applicable_law_refs:
         return ClassifyResponse(
@@ -557,6 +746,7 @@ async def run_pipeline(request: ClassifyRequest) -> ClassifyResponse:
             applicable_laws=[],
             input_parameters=input_params,
             missing_parameters=missing_params,
+            user_action_required=bool(missing_params),
             stages_completed=stages,
             processing_time_seconds=time.monotonic() - start,
             error=translate_error("no_applicable_laws", lang),
@@ -600,7 +790,8 @@ async def run_pipeline(request: ClassifyRequest) -> ClassifyResponse:
 
             for sys_key, sys_mappings in groups.items():
                 sys_var_names = [m["openfisca_variable"] for m in sys_mappings]
-                input_data = _build_input_data(input_params, request.period, system=sys_key)
+                input_data, build_warnings = _build_input_data(input_params, request.period, system=sys_key)
+                pipeline_warnings.extend(build_warnings)
 
                 try:
                     exec_result = await asyncio.to_thread(
@@ -647,7 +838,7 @@ async def run_pipeline(request: ClassifyRequest) -> ClassifyResponse:
             lang,
         )
         # Recompute missing params so filtered-out laws don't contribute
-        missing_params = _compute_missing_parameters(applicable_law_refs, input_params)
+        missing_params = _compute_missing_parameters(applicable_law_refs, input_params, lang)
 
     return ClassifyResponse(
         syllogistic_reasoning=filtered_reasoning,
@@ -656,6 +847,8 @@ async def run_pipeline(request: ClassifyRequest) -> ClassifyResponse:
         input_parameters=input_params,
         code_generation=code_items,
         missing_parameters=missing_params,
+        user_action_required=bool(missing_params),
+        warnings=pipeline_warnings,
         execution=execution,
         stages_completed=stages,
         processing_time_seconds=round(time.monotonic() - start, 2),
@@ -835,6 +1028,8 @@ _ENUM_KEYWORD_MAP: dict[str, dict[str, str]] = {
         "studies": "erstausbildung",
         "studium": "erstausbildung",
         "first": "erstausbildung",
+        "hochschule": "erstausbildung",
+        "universität": "erstausbildung",
         "second degree": "zweitausbildung",
         "retraining": "umschulung",
         "further education": "weiterbildung",
@@ -851,6 +1046,10 @@ _ENUM_KEYWORD_MAP: dict[str, dict[str, str]] = {
     "staatsangehoerigkeit": {
         "swiss": "schweizer",
         "schweiz": "schweizer",
+        "schweizer_buerger": "schweizer",
+        "buerger": "schweizer",
+        "bürgerin": "schweizer",
+        "citizen": "schweizer",
         "eu": "eu_efta_niederlassung",
         "efta": "eu_efta_niederlassung",
         "permit b": "aufenthaltsbewilligung_b",
@@ -858,6 +1057,29 @@ _ENUM_KEYWORD_MAP: dict[str, dict[str, str]] = {
         "refugee": "fluechtling_staatenlos",
     },
 }
+
+
+def _fuzzy_match_variable_name(key: str, tbs_variables: dict) -> str | None:
+    """Try to match an LLM-generated variable name to a TBS variable.
+
+    Checks for common word overlap — e.g. 'ausbildungskosten_pro_jahr'
+    shares 'ausbildungskosten' with 'anerkannte_ausbildungskosten'.
+    Returns the best match or None.
+    """
+    key_parts = set(key.lower().split("_"))
+    best_match = None
+    best_score = 0
+
+    for var_name in tbs_variables:
+        var_parts = set(var_name.lower().split("_"))
+        # Require at least 2 common meaningful parts (ignore short words)
+        meaningful_common = key_parts & var_parts - {"pro", "der", "die", "das", "und", "in", "von"}
+        score = len(meaningful_common)
+        if score >= 2 and score > best_score:
+            best_score = score
+            best_match = var_name
+
+    return best_match
 
 
 def _fuzzy_match_enum(value: str, members: dict, variable_name: str = "") -> str | None:
@@ -896,17 +1118,20 @@ def _build_input_data(
     input_params: dict,
     period: str,
     system: str = "openfisca_switzerland",
-) -> dict | None:
+) -> tuple[dict | None, list[PipelineWarning]]:
     """Convert classifier input_parameters to OpenFisca simulation input format.
 
     Validates each parameter name against the TaxBenefitSystem and uses the
     variable's ``definition_period`` to choose the correct period key
     (``YYYY`` for YEAR variables, ``YYYY-MM`` for MONTH variables).
 
-    Returns None if no parameters could be extracted (runner will use defaults).
+    Returns a (input_data, warnings) tuple.
+    input_data is None if no parameters could be extracted.
     """
+    warnings: list[PipelineWarning] = []
+
     if not input_params:
-        return None
+        return None, warnings
 
     tbs = get_tbs(system)
     person_data: dict = {}
@@ -919,9 +1144,58 @@ def _build_input_data(
         for key, value in params.items():
             if value is None:
                 continue
+            original_key = key  # remember pre-alias key for conversion check
             if key not in tbs.variables:
-                log.warning("Skipping unknown variable %r (not in TBS %s)", key, system)
-                continue
+                # Try alias resolution
+                resolved = _PARAMETER_ALIASES.get(key)
+                if resolved and resolved in tbs.variables:
+                    log.info("Alias-resolved %r -> %r", key, resolved)
+                    key = resolved
+                else:
+                    # Fuzzy fallback: find closest TBS variable by substring match
+                    matched_var = _fuzzy_match_variable_name(key, tbs.variables)
+                    if matched_var:
+                        log.info("Fuzzy-matched variable %r -> %r", key, matched_var)
+                        key = matched_var
+                    else:
+                        log.warning("Skipping unknown variable %r (not in TBS %s)", key, system)
+                        continue
+
+            # Gross income → anrechenbare Mittel conversion
+            if (
+                original_key in _GROSS_INCOME_ALIASES
+                and key in ("eltern_anrechenbare_mittel", "eigene_anrechenbare_mittel")
+                and isinstance(value, (int, float))
+                and value > 0
+            ):
+                original_value = value
+                value = round(value * _GROSS_TO_ANRECHENBAR_FACTOR, 2)
+                target_label = (
+                    "parental countable resources"
+                    if key == "eltern_anrechenbare_mittel"
+                    else "own countable resources"
+                )
+                warnings.append(PipelineWarning(
+                    code="gross_income_converted",
+                    message=(
+                        f"Gross income ({original_value:,.0f}) was converted to "
+                        f"approximate {target_label} ({value:,.0f}) using a "
+                        f"{_GROSS_TO_ANRECHENBAR_FACTOR:.0%} factor."
+                    ),
+                    details=(
+                        "The user provided gross income, but the law (Art. 15 ABG) "
+                        "requires 'anrechenbare Mittel' (countable resources after "
+                        "deductions for taxes, social contributions, and living expenses). "
+                        f"The {_GROSS_TO_ANRECHENBAR_FACTOR:.0%} factor is an approximation. "
+                        "For an accurate result, provide the exact anrechenbare Mittel "
+                        "from the tax declaration."
+                    ),
+                ))
+                log.info(
+                    "Converted gross income %s=%s -> %s=%s (factor %.2f)",
+                    original_key, original_value, key, value, _GROSS_TO_ANRECHENBAR_FACTOR,
+                )
+
             var = tbs.variables[key]
 
             # Handle Enum variables: accept valid enum member names
@@ -956,14 +1230,14 @@ def _build_input_data(
                 person_data[key] = {period_key: value}
 
     if not person_data and not household_data:
-        return None
+        return None, warnings
 
     role_key = _HOUSEHOLD_ROLES.get(system, "parents")
     result = {
         "persons": {"p1": person_data},
         "households": {"h1": {role_key: ["p1"], **household_data}},
     }
-    return result
+    return result, warnings
 
 
 def _filter_inapplicable_laws(
@@ -995,6 +1269,7 @@ def _filter_inapplicable_laws(
         var_to_system[m["openfisca_variable"]] = m.get("system", "openfisca_switzerland")
 
     # Identify laws to remove: only boolean variables that evaluated to False
+    # AND only if all required inputs were provided (no nulls)
     refs_to_remove: set[str] = set()
     for var_name, value in execution.computed_values.items():
         sys_key = var_to_system.get(var_name, "openfisca_switzerland")
@@ -1006,10 +1281,21 @@ def _filter_inapplicable_laws(
             if var_def.value_type is bool and value <= 0:
                 ref = var_to_ref.get(var_name)
                 if ref:
+                    # Don't remove if the law had missing/null inputs — the
+                    # False result may be due to incomplete data, not true
+                    # inapplicability.
+                    law_params = input_params.get(ref, {})
+                    has_nulls = any(
+                        v is None for v in (law_params.values() if isinstance(law_params, dict) else [])
+                    )
+                    if has_nulls:
+                        log.info("Keeping %r despite False — has null inputs", ref)
+                        continue
                     refs_to_remove.add(ref)
         except Exception:
             log.warning("Could not check value_type for %r", var_name)
 
+    log.info("Filter: refs_to_remove=%s", refs_to_remove)
     if not refs_to_remove:
         filtered = _strip_major_premise(
             _filter_reasoning_by_applicable_laws(raw_reasoning, applicable_law_refs),
