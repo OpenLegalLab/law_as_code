@@ -17,7 +17,7 @@ from case_classifier.law_index import (
     get_law_by_reference,
 )
 
-from oll_law_as_code.runner import run_variables, get_tbs, _HOUSEHOLD_ROLES
+from openfisca_core.simulations import SimulationBuilder
 
 from oll_api_server.i18n import (
     build_language_prefix,
@@ -37,6 +37,92 @@ log = logging.getLogger(__name__)
 # Module-level caches populated at startup
 _law_cache: list[dict] = []
 _law_index_prompt: str = ""
+
+# ---------------------------------------------------------------------------
+# TaxBenefitSystem helpers (previously expected from oll_law_as_code.runner)
+# ---------------------------------------------------------------------------
+
+_HOUSEHOLD_ROLES: dict[str, str] = {
+    "openfisca_switzerland": "parents",
+    "bern_stipendium": "applicants",
+}
+
+_tbs_cache: dict[str, object] = {}
+
+
+def get_tbs(system: str = "openfisca_switzerland"):
+    """Return a cached TaxBenefitSystem instance for *system*."""
+    if system in _tbs_cache:
+        return _tbs_cache[system]
+
+    if system == "openfisca_switzerland":
+        from openfisca_switzerland import CountryTaxBenefitSystem
+    elif system == "bern_stipendium":
+        from bern_stipendium import CountryTaxBenefitSystem
+    else:
+        raise ValueError(f"Unknown TBS system: {system!r}")
+
+    tbs = CountryTaxBenefitSystem()
+    _tbs_cache[system] = tbs
+    return tbs
+
+
+def warm_tbs_cache() -> None:
+    """Pre-load all known TaxBenefitSystem instances at startup."""
+    for system in _HOUSEHOLD_ROLES:
+        try:
+            get_tbs(system)
+            log.info("Warmed TBS cache for %s", system)
+        except Exception:
+            log.warning("Could not warm TBS cache for %s", system, exc_info=True)
+
+
+def run_variables(
+    variable_names: list[str],
+    input_data: dict | None,
+    period: str,
+    system: str = "openfisca_switzerland",
+    tbs=None,
+) -> ExecutionResult:
+    """Execute pre-registered OpenFisca variables by name."""
+    if tbs is None:
+        tbs = get_tbs(system)
+
+    if input_data is None:
+        role = _HOUSEHOLD_ROLES.get(system, "parents")
+        input_data = {
+            "persons": {"p1": {}},
+            "households": {"h1": {role: ["p1"]}},
+        }
+
+    try:
+        builder = SimulationBuilder()
+        simulation = builder.build_from_dict(tbs, input_data)
+    except Exception as exc:
+        return ExecutionResult(
+            success=False, error=f"{type(exc).__name__}: {exc}",
+            error_stage="simulate",
+        )
+
+    computed: dict[str, float] = {}
+    year = period[:4]
+    try:
+        for name in variable_names:
+            # Use the variable's definition_period to pick the right period
+            var = tbs.variables.get(name)
+            if var and str(var.definition_period).upper() == "YEAR":
+                calc_period = year
+            else:
+                calc_period = period
+            result_array = simulation.calculate(name, calc_period)
+            computed[name] = float(result_array[0])
+    except Exception as exc:
+        return ExecutionResult(
+            success=False, error=f"{type(exc).__name__}: {exc}",
+            error_stage="calculate", computed_values=computed,
+        )
+
+    return ExecutionResult(success=True, computed_values=computed)
 
 
 def load_law_index() -> None:
@@ -275,6 +361,13 @@ def _merge_known_parameters(
 
     for ref in applicable_law_refs:
         law = get_law_by_reference(ref, _law_cache)
+        # Fallback: classifier may return "ABG Art. 1-16 — Full Name"; try prefix match
+        if not law:
+            for candidate in _law_cache:
+                art_ref = candidate["article_reference"]
+                if ref.startswith(art_ref) or art_ref.startswith(ref):
+                    law = candidate
+                    break
         if law is None:
             continue
 
@@ -347,9 +440,16 @@ def _lookup_variables(applicable_law_refs: list[str]) -> list[dict]:
     results: list[dict] = []
     for ref in applicable_law_refs:
         law = get_law_by_reference(ref, _law_cache)
+        # Fallback: classifier may return "ABG Art. 1-16 — Full Name"; try prefix match
+        if not law:
+            for candidate in _law_cache:
+                art_ref = candidate["article_reference"]
+                if ref.startswith(art_ref) or art_ref.startswith(ref):
+                    law = candidate
+                    break
         if law and law.get("openfisca_variable"):
             results.append({
-                "article_reference": ref,
+                "article_reference": law["article_reference"],
                 "openfisca_variable": law["openfisca_variable"],
                 "law_name": law.get("law_name", ""),
                 "system": law.get("system", "openfisca_switzerland"),
@@ -400,9 +500,40 @@ async def run_pipeline(request: ClassifyRequest) -> ClassifyResponse:
 
     applicable_law_refs = parse_applicable_laws(result.applicable_laws)
     input_params = parse_input_parameters(result.input_parameters)
+
+    # Remove articles the reasoning explicitly excludes
+    excluded_articles = _extract_excluded_articles(result.syllogistic_reasoning)
+    if excluded_articles:
+        log.info("Excluding articles per reasoning: %s", excluded_articles)
+
+        def _normalise_ref(ref: str) -> str | None:
+            m = re.search(r"([A-Z]{2,})\s+Art\.?\s*(\d+\w*)", ref)
+            return f"{m.group(1)} Art. {m.group(2)}" if m else None
+
+        applicable_law_refs = [
+            ref for ref in applicable_law_refs
+            if _normalise_ref(ref) not in excluded_articles
+        ]
+
+    # Ensure articles mentioned positively in syllogistic reasoning are in applicable_laws
+    reasoning_articles = _extract_articles_from_reasoning(
+        result.syllogistic_reasoning
+    )
+    existing_norm: set[str] = set()
+    for ref in applicable_law_refs:
+        m = re.search(r"([A-Z]{2,})\s+Art\.?\s*(\d+\w*)", ref)
+        if m:
+            existing_norm.add(f"{m.group(1)} Art. {m.group(2)}")
+    for art in reasoning_articles:
+        if art not in existing_norm and art not in excluded_articles:
+            applicable_law_refs.append(art)
+            existing_norm.add(art)
+
     filtered_reasoning = _filter_reasoning_by_applicable_laws(
         result.syllogistic_reasoning, applicable_law_refs
     )
+    # Strip Major Premise — only keep Minor Premise + Conclusion
+    filtered_reasoning = _strip_major_premise(filtered_reasoning, lang)
     legal_reasoning = _extract_legal_reasoning(filtered_reasoning, lang)
     stages.append("classification")
 
@@ -575,6 +706,31 @@ _INFERENCE_BLOCKERS: dict[str, list[str]] = {
 }
 
 
+_ANNUAL_INCOME_PATTERNS = re.compile(
+    r"(\d[\d\s'_.]*)\s*(?:chf|franken|francs)?\s*(?:/\s*(?:year|jahr|an|anno)|per\s+(?:year|jahr|an|anno)|pro\s+jahr|par\s+an|j[aä]hrlich|annual|annuell)",
+    re.IGNORECASE,
+)
+
+
+def _fix_annual_as_monthly(lower_text: str, law_params: dict) -> None:
+    """Divide gross_monthly_salary by 12 when the LLM filled it with the annual value."""
+    salary = law_params.get("gross_monthly_salary")
+    if salary is None or not isinstance(salary, (int, float)):
+        return
+    # Heuristic: if case text mentions annual income and the value matches,
+    # the LLM likely put the annual figure into the monthly field.
+    for m in _ANNUAL_INCOME_PATTERNS.finditer(lower_text):
+        raw = m.group(1).replace("'", "").replace("_", "").replace(" ", "").replace(".", "")
+        try:
+            annual = float(raw)
+        except ValueError:
+            continue
+        if abs(salary - annual) < 1:  # LLM put annual into monthly
+            law_params["gross_monthly_salary"] = round(annual / 12, 2)
+            log.info("Corrected gross_monthly_salary: %s → %s (annual/12)", salary, law_params["gross_monthly_salary"])
+            return
+
+
 def _infer_parameters_from_text(
     case_description: str,
     input_params: dict,
@@ -599,6 +755,9 @@ def _infer_parameters_from_text(
 
         # Phase 1: Correct impossible LLM values
         _correct_impossible_values(lower_text, law_params, ref)
+
+        # Phase 1b: Fix gross_monthly_salary when LLM puts annual value
+        _fix_annual_as_monthly(lower_text, law_params)
 
         # Phase 2: Fill nulls from keywords
         for keywords, param_name, value in _INFERENCE_RULES:
@@ -852,12 +1011,13 @@ def _filter_inapplicable_laws(
             log.warning("Could not check value_type for %r", var_name)
 
     if not refs_to_remove:
+        filtered = _strip_major_premise(
+            _filter_reasoning_by_applicable_laws(raw_reasoning, applicable_law_refs),
+            language,
+        )
         return (applicable_law_refs, code_items, input_params, execution,
-                _filter_reasoning_by_applicable_laws(raw_reasoning, applicable_law_refs),
-                _extract_legal_reasoning(
-                    _filter_reasoning_by_applicable_laws(raw_reasoning, applicable_law_refs),
-                    language,
-                ))
+                filtered,
+                _extract_legal_reasoning(filtered, language))
 
     # Filter all outputs
     new_law_refs = [r for r in applicable_law_refs if r not in refs_to_remove]
@@ -883,7 +1043,9 @@ def _filter_inapplicable_laws(
     )
 
     # Re-filter reasoning for remaining laws
-    new_reasoning = _filter_reasoning_by_applicable_laws(raw_reasoning, new_law_refs)
+    new_reasoning = _strip_major_premise(
+        _filter_reasoning_by_applicable_laws(raw_reasoning, new_law_refs), language
+    )
     new_legal_reasoning = _extract_legal_reasoning(new_reasoning, language)
 
     # Edge case: all laws filtered out
@@ -900,7 +1062,159 @@ def _filter_inapplicable_laws(
 
 
 _ARTICLE_HEADER_RE = re.compile(r"\b([A-Z]{2,})\s+Art\.?\s+(\d+\w*)\b")
-_BULLET_RE = re.compile(r"^(?:[-*+]|\d+[.)]) *")
+_BULLET_RE = re.compile(r"^(?:[-+]|\*(?!\*)|\d+[.)]) *")
+_MAJOR_PREMISE_RE = re.compile(
+    r"^(?:\*{0,2}\s*)?(?:major premise|prémisse majeure|premise majeure"
+    r"|obersatz|hauptsatz|premessa maggiore)",
+    re.IGNORECASE,
+)
+
+
+def _strip_major_premise(reasoning: str, language: str = "en") -> str:
+    """Remove Major Premise sections, keeping only Minor Premise + Conclusion.
+
+    Walks the lines and skips everything between a Major Premise header and the
+    next Minor Premise / Conclusion / article section header.  Standalone
+    article section headers (e.g. ``### OR Art. 41 — …``) are always kept,
+    but article references *inside* a major premise body are stripped.
+    """
+    if not reasoning:
+        return reasoning
+
+    headers = get_section_headers(language)
+    lines = reasoning.split("\n")
+    kept: list[str] = []
+    skip = False
+
+    for line in lines:
+        stripped = line.strip()
+        # Strip markdown heading markers and bullet/list prefixes for header detection
+        no_hashes = re.sub(r"^#{1,6}\s+", "", stripped)
+        no_hashes = re.sub(r"^[-*•]\s+", "", no_hashes)
+        lower = no_hashes.lower()
+
+        # Major Premise header — start skipping
+        if _starts_with_any(lower, headers["major_premise"]):
+            skip = True
+            continue
+
+        # Minor Premise or Conclusion header — stop skipping
+        if _starts_with_any(lower, headers["minor_premise"]) or _starts_with_any(
+            lower, headers["conclusion"]
+        ):
+            skip = False
+            kept.append(line)
+            continue
+
+        # Standalone article section header (### AHVG Art. 5 — …) — reset
+        if _ARTICLE_HEADER_RE.search(line) and (stripped.startswith("#") or re.match(r"^[-*•]\s+", stripped)):
+            skip = False
+            bare = re.sub(r"^[-*•]\s+", "", stripped)
+            bare = re.sub(r"^#{1,6}\s+", "", bare)
+            bare = bare.strip("*").strip()
+            kept.append(f"### {bare}" if bare else line)
+            continue
+
+        if not skip:
+            kept.append(line)
+
+    # Clean up leading/trailing blank lines
+    return "\n".join(kept).strip()
+
+
+def _extract_excluded_articles(reasoning: str) -> set[str]:
+    """Detect articles whose reasoning conclusion says they are NOT applicable.
+
+    Looks for exclusion phrases like "not triggered", "excluded", "not applicable",
+    "not enough information" in the conclusion part of each reasoning section.
+    Returns a set of normalised references (e.g. ``{'AHVG Art. 3', 'ABG Art. 1'}``).
+    """
+    if not reasoning:
+        return set()
+
+    excluded: set[str] = set()
+    _EXCLUSION_PHRASES = [
+        "not triggered", "excluded", "not applicable", "not enough information",
+        "does not apply", "do not apply", "is not relevant", "not relevant",
+        "no indication", "no facts", "not at issue", "not directly relevant",
+        "nicht anwendbar", "ausgeschlossen", "nicht ausgelöst",
+        "nicht relevant", "nicht einschlägig", "keine Anhaltspunkte",
+        "pas applicable", "exclu", "non applicable", "pas pertinent",
+        "none are triggered", "none of those", "not implicated",
+        "no basis", "no evidence", "unrelated",
+    ]
+
+    # Split into per-article sections
+    sections: list[tuple[str | None, str]] = []
+    current_key: str | None = None
+    current_lines: list[str] = []
+
+    for line in reasoning.split("\n"):
+        m = _ARTICLE_HEADER_RE.search(line)
+        if m:
+            if current_key is not None:
+                sections.append((current_key, "\n".join(current_lines)))
+            current_key = f"{m.group(1)} Art. {m.group(2)}"
+            current_lines = [line]
+        else:
+            current_lines.append(line)
+    if current_key is not None:
+        sections.append((current_key, "\n".join(current_lines)))
+
+    for key, section_text in sections:
+        lower = section_text.lower()
+        if any(phrase in lower for phrase in _EXCLUSION_PHRASES):
+            excluded.add(key)
+
+    return excluded
+
+
+def _extract_articles_from_reasoning(reasoning: str) -> list[str]:
+    """Extract article references whose reasoning positively concludes applicability.
+
+    Only returns articles whose section contains positive applicability signals
+    (e.g. "the law applies", "is applicable"). Articles merely *mentioned* but
+    not positively concluded are excluded — this prevents irrelevant laws from
+    being added back just because the reasoning discussed them.
+    """
+    if not reasoning:
+        return []
+
+    _POSITIVE_PHRASES = [
+        "applies", "is applicable", "the law applies", "law applies",
+        "therefore applicable", "conditions are met", "conditions are satisfied",
+        "is triggered", "are triggered",
+        "anwendbar", "greift", "ist erfüllt", "kommt zur anwendung",
+        "applicable", "s'applique", "conditions remplies",
+    ]
+
+    # Split into per-article sections
+    sections: list[tuple[str, list[str]]] = []
+    current_key: str | None = None
+    current_lines: list[str] = []
+
+    for line in reasoning.split("\n"):
+        m = _ARTICLE_HEADER_RE.search(line)
+        if m:
+            if current_key is not None:
+                sections.append((current_key, current_lines))
+            current_key = f"{m.group(1)} Art. {m.group(2)}"
+            current_lines = [line]
+        else:
+            current_lines.append(line)
+    if current_key is not None:
+        sections.append((current_key, current_lines))
+
+    refs: list[str] = []
+    seen: set[str] = set()
+    for key, lines in sections:
+        if key in seen:
+            continue
+        section_lower = "\n".join(lines).lower()
+        if any(phrase in section_lower for phrase in _POSITIVE_PHRASES):
+            refs.append(key)
+            seen.add(key)
+    return refs
 
 
 def _filter_reasoning_by_applicable_laws(

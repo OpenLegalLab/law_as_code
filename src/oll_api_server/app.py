@@ -13,8 +13,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from oll_api_server.config import settings
-from oll_api_server.pipeline import load_law_index, validate_law_index_variables
-from oll_law_as_code.runner import warm_tbs_cache
+from oll_api_server.pipeline import load_law_index, validate_law_index_variables, warm_tbs_cache
 from oll_api_server.routers import augment, classify, health
 
 log = logging.getLogger(__name__)
