@@ -1,0 +1,64 @@
+{
+  "transform.predict": {
+    "traces": [],
+    "train": [],
+    "demos": [
+      {
+        "augmented": true,
+        "legal_article_text": "Art. 10 — Beiträge der Selbständigerwerbenden\n\n1 Vom Einkommen aus selbständiger Erwerbstätigkeit wird ein Beitrag von 8,1 Prozent erhoben.\n\n2 Das Einkommen aus selbständiger Erwerbstätigkeit wird für die Berechnung des Beitrages auf die nächsten 100 Franken abgerundet.",
+        "article_reference": "AHVG Art. 10",
+        "reasoning": "1. Art. 10 para. 1 levies a contribution of 8.1% on income from self-employment.\n2. The contribution is a monetary amount → value_type = float.\n3. It applies to self-employed individuals → entity = Person.\n4. Contributions are typically calculated annually → definition_period = YEAR.\n5. The formula multiplies rounded self-employment income by the AHV self-employed rate (8.1%).\n6. The income must be rounded down to the nearest 100 CHF → use floor(x / 100) * 100.\n7. The rate (0.081) is stored in parameters with possible historical changes.",
+        "openfisca_variable": "from openfisca_core.model_api import *\nfrom openfisca_switzerland.entities import Person\n\n\nclass ahv_self_employed_contribution(Variable):\n    value_type = float\n    entity = Person\n    definition_period = YEAR\n    label = \"AHV contribution for self-employed persons (Art. 10 AHVG)\"\n\n    def formula(person, period, parameters):\n        self_employment_income = person(\"self_employment_income\", period)\n        rate = parameters(period).social_security.ahv.self_employed_rate\n        rounded_income = (self_employment_income // 100) * 100\n        return rounded_income * rate",
+        "parameter_yaml": "social_security:\n  ahv:\n    self_employed_rate:\n      description: AHV contribution rate for self-employed persons (Art. 10 AHVG)\n      metadata:\n        unit: /1\n        reference:\n          - title: \"AHVG Art. 10 — Beiträge der Selbständigerwerbenden\"\n            href: \"https://www.fedlex.admin.ch/eli/cc/63/837_843_843/de#art_10\"\n      values:\n        2024-01-01:\n          value: 0.081\n        2020-01-01:\n          value: 0.078\n        1997-01-01:\n          value: 0.076"
+      },
+      {
+        "augmented": true,
+        "legal_article_text": "Art. 3 — Obligatorisch versicherte Personen\n\n1 Obligatorisch versichert sind natürliche Personen mit Wohnsitz in der Schweiz.\n\n2 Obligatorisch versichert sind auch natürliche Personen, die in der Schweiz eine Erwerbstätigkeit ausüben.\n\n3 Die Versicherungspflicht beginnt am 1. Januar nach Vollendung des 17. Altersjahres.",
+        "article_reference": "AHVG Art. 3",
+        "reasoning": "1. Art. 3 defines who is compulsorily insured under AHV.\n2. Paragraph 1: Individuals with residence in Switzerland → condition on \"resides_in_switzerland\".\n3. Paragraph 2: Individuals working in Switzerland, regardless of residence → condition on \"works_in_switzerland\".\n4. Paragraph 3: Insurance obligation starts on January 1st after turning 17 → compute age and compare, then apply a start date.\n5. The variable determines if a person is subject to AHV insurance → boolean type.\n6. Evaluation is per person and typically relevant per month → definition_period = MONTH.\n7. The logic combines three conditions with an OR: (resides in CH) OR (works in CH) AND age condition.\n8. Age threshold is parameterizable; the birthday cutoff (Jan 1) is fixed.",
+        "openfisca_variable": "from openfisca_core.model_api import *\nfrom openfisca_switzerland.entities import Person\n\n\nclass ahv_insurance_obligation(Variable):\n    value_type = bool\n    entity = Person\n    definition_period = MONTH\n    label = \"Obligatory AHV insurance (Art. 3 AHVG)\"\n\n    def formula(person, period, parameters):\n        born_on = person(\"birth_date\", period)\n        legal_age_threshold = parameters(period).social_security.ahv.mandatory_insurance.age_threshold\n        age = (period.date - born_on).days / 365.25\n\n        after_min_age = age >= legal_age_threshold\n\n        resides_in_ch = person(\"resides_in_switzerland\", period)\n        works_in_ch = person(\"works_in_switzerland\", period)\n\n        return (resides_in_ch | works_in_ch) & after_min_age",
+        "parameter_yaml": "mandatory_insurance:\n  description: Conditions for mandatory AHV insurance\n  age_threshold:\n    description: Minimum age for mandatory insurance (Art. 3 para. 3 AHVG)\n    metadata:\n      unit: years\n      reference:\n        - title: \"AHVG Art. 3 — Obligatorisch versicherte Personen\"\n          href: \"https://www.fedlex.admin.ch/eli/cc/63/837_843_843/de#art_3\"\n    values:\n      2024-01-01:\n        value: 17\n      1948-01-01:\n        value: 17"
+      },
+      {
+        "legal_article_text": "Art. 5 — Beiträge von Einkommen aus unselbständiger Erwerbstätigkeit\n\n1 Vom Einkommen aus unselbständiger Erwerbstätigkeit, nachfolgend massgebender Lohn genannt, wird ein Beitrag von 4,35 Prozent erhoben.\n\n2 Als massgebender Lohn gilt jedes Entgelt für in unselbständiger Stellung auf bestimmte oder unbestimmte Zeit geleistete Arbeit.",
+        "article_reference": "AHVG Art. 5",
+        "openfisca_variable": "from openfisca_core.model_api import *\nfrom openfisca_switzerland.entities import Person\n\n\nclass ahv_employee_contribution(Variable):\n    value_type = float\n    entity = Person\n    definition_period = MONTH\n    label = \"AHV/IV/EO employee contribution (Art. 5 AHVG)\"\n\n    def formula(person, period, parameters):\n        gross_salary = person(\"gross_monthly_salary\", period)\n        rate = parameters(period).social_security.ahv.employee_rate\n        return gross_salary * rate",
+        "parameter_yaml": "description: AHV/IV/EO employee contribution rate (Art. 5 AHVG)\nmetadata:\n  unit: /1\n  reference:\n    - title: \"AHVG Art. 5 — Beiträge von Einkommen aus unselbständiger Erwerbstätigkeit\"\n      href: \"https://www.fedlex.admin.ch/eli/cc/63/837_843_843/de#art_5\"\nvalues:\n  2024-01-01:\n    value: 0.0435\n  2020-01-01:\n    value: 0.0425\n  1997-01-01:\n    value: 0.0415",
+        "reasoning": "1. Art. 5 para. 1 levies a contribution of 4.35% on employment income.\n2. The contribution is a monetary amount → value_type = float.\n3. It applies to individual employees → entity = Person.\n4. Salary is typically monthly → definition_period = MONTH.\n5. The formula multiplies gross_monthly_salary by the employee_rate parameter.\n6. The rate (0.0435) is stored in a YAML parameter file with historical values."
+      }
+    ],
+    "signature": {
+      "instructions": "Transform a Swiss legal article into executable OpenFisca code.\n\nGiven the full text of a Swiss federal legal article (e.g. from AHVG),\nproduce a Python Variable class for OpenFisca and a YAML parameter snippet\nthat faithfully implement the legal logic.",
+      "fields": [
+        {
+          "prefix": "Legal Article Text:",
+          "description": "Full text of a Swiss federal legal article (German, French, or Italian)"
+        },
+        {
+          "prefix": "Article Reference:",
+          "description": "Article identifier, e.g. 'AHVG Art. 5' or 'DBG Art. 25'"
+        },
+        {
+          "prefix": "Reasoning:",
+          "description": "Step-by-step explanation of how the legal text maps to the code"
+        },
+        {
+          "prefix": "Openfisca Variable:",
+          "description": "Python class inheriting from Variable with a formula() method implementing the legal logic"
+        },
+        {
+          "prefix": "Parameter Yaml:",
+          "description": "YAML snippet defining OpenFisca parameters (rates, thresholds) referenced by the variable"
+        }
+      ]
+    },
+    "lm": null
+  },
+  "metadata": {
+    "dependency_versions": {
+      "python": "3.12",
+      "dspy": "3.2.0",
+      "cloudpickle": "3.1"
+    }
+  }
+}
