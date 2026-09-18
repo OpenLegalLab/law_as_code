@@ -848,9 +848,53 @@ select.field-input {
   line-height: 1.4;
 }
 
+/* HERO BRAND MARK */
+/* logo.jpeg is a 1024x1024 source asset. Without an explicit size it renders
+   at natural size and bursts out of the 720px hero card. */
+.hero-logo {
+  display: block;
+  width: 88px;
+  height: 88px;
+  object-fit: contain;
+  border-radius: 14px;
+  margin: 44px auto -16px;
+}
+
+/* SUBMIT BUTTON LOADING DOTS */
+.btn-loading {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.btn-loading span {
+  width: 6px;
+  height: 6px;
+  background: currentColor;
+  border-radius: 50%;
+  animation: bounce 1.4s infinite ease-in-out;
+}
+
+.btn-loading span:nth-child(2) { animation-delay: 0.15s; }
+.btn-loading span:nth-child(3) { animation-delay: 0.3s; }
+
+/* INLINE FIELD ERROR */
+.field-error {
+  display: block;
+  margin-top: 6px;
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--swiss-red-deep);
+}
+
+/* The markup toggles the `hidden` attribute, which `display: block` would
+   otherwise defeat. */
+.field-error[hidden] { display: none; }
+
 /* Mobile */
 @media (max-width: 600px) {
   .hero-inner { padding: 36px 24px; }
+  .hero-logo { width: 64px; height: 64px; margin: 30px auto -12px; }
   .header { padding: 16px 20px; }
   .main { padding: 20px; }
   .hero-footer { flex-direction: column; gap: 10px; align-items: flex-start; }
