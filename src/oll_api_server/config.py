@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     cerebras_model: str = "qwen-3-235b-a22b-instruct-2507"
     openjustice_api_key: str = ""
     openjustice_model: str = "gpt-5.4-nano"
+    claude_model: str = "claude-opus-5"
 
     # --- Server ---
     host: str = "0.0.0.0"

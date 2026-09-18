@@ -26,11 +26,16 @@ def _configure_lm() -> None:
     """Configure the DSPy language model based on settings."""
     from case_classifier.openjustice_lm import OpenJusticeLM
 
-    if settings.llm_provider.lower() == "openjustice":
+    provider = settings.llm_provider.lower()
+    if provider == "openjustice":
         lm = OpenJusticeLM(
             model=settings.openjustice_model,
             api_key=settings.openjustice_api_key,
         )
+    elif provider in ("claude", "claude_agent"):
+        from case_classifier.claude_agent_lm import ClaudeAgentLM
+
+        lm = ClaudeAgentLM(model=settings.claude_model)
     else:
         lm = dspy.LM(
             model=f"cerebras/{settings.cerebras_model}",

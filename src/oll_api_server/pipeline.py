@@ -45,7 +45,11 @@ _law_index_prompt: str = ""
 
 _HOUSEHOLD_ROLES: dict[str, str] = {
     "openfisca_switzerland": "parents",
-    "bern_stipendium": "applicants",
+    # The Bern household entity names the applicant role "auszubildender"
+    # (plural "auszubildende") -- see bern_stipendium/entities.py. There is no
+    # "applicants" role, so the old value made every simulation fail with
+    # SituationParsingError.
+    "bern_stipendium": "auszubildende",
 }
 
 _tbs_cache: dict[str, object] = {}
